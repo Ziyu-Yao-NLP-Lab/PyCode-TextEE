@@ -21,6 +21,13 @@ class LLaMATrainer(SFTTrainer):
         logger.info("Running evaluation loop...")
         FastLanguageModel.for_inference(self.model) # Enable native 2x faster inference
 
+        # Decoder-only models must be LEFT-padded for batched generation. The eval
+        # collator otherwise right-pads (this is the "right-padding was detected"
+        # warning), which makes generate() continue from pad positions and emit
+        # garbage that no longer matches the expected `[Event(...)]` output format.
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         outputs = []
         all_decoder_ids = []
@@ -38,9 +45,11 @@ class LLaMATrainer(SFTTrainer):
         with torch.no_grad():
             for batch_idx, eval_set in tqdm(enumerate(eval_loader), total=len(eval_loader), desc=f"Hold on, :D, doing {metric_key_prefix} ..."):
                 # Prepare batched input_ids
-                input_ids = eval_set["input_ids"]#torch.tensor([item['input_ids'] for item in eval_set]).to(self.model.device)
+                input_ids = eval_set["input_ids"].to(self.model.device)
+                # Pass the attention mask so padded positions are ignored during generation.
+                attention_mask = eval_set["attention_mask"].to(self.model.device)
                 # Generate outputs for the entire batch
-                decoder_ids = self.model.generate(input_ids,max_new_tokens=250, pad_token_id = self.tokenizer.pad_token_id)
+                decoder_ids = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=250, pad_token_id = self.tokenizer.pad_token_id)
                 # Decode all outputs in the batch
                 decoded_output = self.tokenizer.batch_decode(decoder_ids, skip_special_tokens=True)
                 # Decode the input sentences in the batch
@@ -79,5 +88,8 @@ class LLaMATrainer(SFTTrainer):
         del all_decoder_ids
         torch.cuda.empty_cache()
         gc.collect()
+        # Restore the original padding side so training (loss computed over
+        # right-padded batches) is unaffected by the left-padding used for generation.
+        self.tokenizer.padding_side = original_padding_side
         FastLanguageModel.for_training(self.model)
         return output_metrics
