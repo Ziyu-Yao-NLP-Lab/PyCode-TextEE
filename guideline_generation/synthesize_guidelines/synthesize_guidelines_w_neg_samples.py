@@ -24,7 +24,25 @@ dataset_mapper = {
 }
 
 parser = argparse.ArgumentParser()
-parser.add_argument("-d", "--dataset_name", help="Dataset Name", default="richere-en")
+parser.add_argument("-d", "--dataset_name", help="Dataset Name (used for the output prompts/<dataset_name> subdir)", default="richere-en")
+# New-dataset mode: derive everything (event types, argument lists, positive/negative example
+# pools) from a single TextEE-style master JSONL, so no uncommitted def_file/ontology/example_dir
+# are required. Each line: {"text": ..., "event_mentions": {"<Event(Parent)>": {"results": [ {...} ]}}}.
+parser.add_argument("--master_file", default=None,
+                    help="Path to a TextEE-style master JSONL. If given, def_file/event_arg_ontology/"
+                         "example_dir are derived from it and are not needed.")
+# Explicit-paths mode (legacy): override the hardcoded dataset_mapper entries.
+parser.add_argument("--def_file", default=None, help="Override def_file path.")
+parser.add_argument("--event_arg_ontology", default=None,
+                    help="Override ontology path (optional; argument names are taken from def_file if absent).")
+parser.add_argument("--example_dir", default=None, help="Override per-event example_dir path.")
+parser.add_argument("--output_dir", default="prompts", help="Where prompt subdirs are written (default: ./prompts).")
+parser.add_argument("--neg_strategy", choices=["sibling", "random"], default="sibling",
+                    help="Negative sampling: 'sibling' (Guideline-PS) or 'random' across event types (Guideline-PN).")
+parser.add_argument("--num_negatives", type=int, default=10, help="Target number of negative examples.")
+parser.add_argument("--examples_per_event", type=int, default=1, help="Negative examples drawn per selected event type.")
+parser.add_argument("--max_samples", type=int, default=MAX_SAMPLES, help="Max positive examples per event type.")
+parser.add_argument("--seed", type=int, default=1337, help="Random seed (makes negative sampling reproducible).")
 
 
 PROMPT = """You are an expert in annotating NLP datasets for event extraction.Your task is to generate precise and detailed annotation guidelines for the event type [###Event_Type###]
@@ -321,92 +339,151 @@ def create_examples(event_type_dict, event_type, full_argument_list):
 #############################################################Guideline-PS#########################################################################################
 ############ This below is the function to add negative samples such that I add 1 examples each from only the sibling event types  ###################
 #############################################################################################################################################################
-def create_negative_examples(all_event_types, current_event_type, dataset_name, num_negatives, examples_per_event=1):
+def _load_event_examples(event_type, example_pools=None, example_dir=None):
+    """Return the example list for an event type from in-memory pools or from example_dir files."""
+    if example_pools is not None:
+        return list(example_pools.get(event_type, []))
+    file_path = f"{example_dir}/{event_type}.json"
+    try:
+        with open(file_path, 'r') as file:
+            return [json.loads(line) for line in file]
+    except FileNotFoundError:
+        print(f"Warning: File not found for event type {event_type} at {file_path}")
+        return []
+
+
+def create_negative_examples(all_event_types, current_event_type, num_negatives, examples_per_event=1,
+                             strategy="sibling", example_pools=None, example_dir=None):
     print("****" * 50)
-    print("Negative Examples")
+    print(f"Negative Examples (strategy={strategy})")
 
-    # Extract the superclass of the current event type
-    current_superclass = current_event_type.split('(')[-1].rstrip(')')
-    print(f"Superclass of current event type: {current_superclass}")
+    if strategy == "sibling":
+        # Guideline-PS: negatives are sibling event types sharing the same superclass.
+        current_superclass = current_event_type.split('(')[-1].rstrip(')')
+        candidate_event_types = [
+            et for et in all_event_types
+            if et != current_event_type and et != "None"
+            and et.split('(')[-1].rstrip(')') == current_superclass
+        ]
+        print(f"Sibling event types for negatives: {candidate_event_types}")
+    else:
+        # Guideline-PN: negatives are randomly drawn across all other event types.
+        candidate_event_types = [et for et in all_event_types if et != current_event_type and et != "None"]
 
-    # Filter sibling event types
-    sibling_event_types = [
-        et for et in all_event_types
-        if et != current_event_type and et.split('(')[-1].rstrip(')') == current_superclass
-    ]
-    print(f"Sibling event types for negatives: {sibling_event_types}")
-
-    # Randomly select up to 15 sibling event types
-    selected_event_types = random.sample(sibling_event_types, min(15, len(sibling_event_types)))
-    print(f"Randomly selected sibling event types for negatives: {selected_event_types}")
+    # Randomly select up to 15 event types (seeded in __main__ for reproducibility).
+    selected_event_types = random.sample(candidate_event_types, min(15, len(candidate_event_types)))
+    print(f"Selected event types for negatives: {selected_event_types}")
 
     negative_examples = []
 
-    # Function to count attributes in an example's results section
     def count_attributes_in_results(example, event_type):
         results = example['event_mentions'][event_type]['results']
         return max(len(result.keys()) for result in results) if results else 0
 
-    # Fetch examples from the selected sibling event types
     for event_type in selected_event_types:
-        file_path = f"{dataset_mapper[dataset_name]['example_dir']}/{event_type}.json"
-        try:
-            with open(file_path, 'r') as file:
-                examples = [json.loads(line) for line in file]
-
-                # Sort examples by the number of attributes in the results section
-                examples_sorted = sorted(
-                    examples,
-                    key=lambda ex: count_attributes_in_results(ex, event_type),
-                    reverse=True
-                )
-
-                print(f"Loaded and sorted {len(examples_sorted)} examples from {event_type}")
-
-                # Select up to `examples_per_event` examples per sibling event type
-                num_to_select = min(examples_per_event, len(examples_sorted))
-                selected_samples = examples_sorted[:num_to_select]
-                negative_examples.extend(selected_samples)
-
-                print(f"Selected {len(selected_samples)} negatives from {event_type}")
-                for sample in selected_samples:
-                    attr_count = count_attributes_in_results(sample, event_type)
-                    print(f"Example with {attr_count} attributes: {sample['text']}")
-        except FileNotFoundError:
-            print(f"Warning: File not found for event type {event_type} at {file_path}")
-
-    print("Negative examples list:")
-    print(negative_examples)  # Directly print the list of all negative examples
+        examples = _load_event_examples(event_type, example_pools=example_pools, example_dir=example_dir)
+        if not examples:
+            continue
+        examples_sorted = sorted(
+            examples,
+            key=lambda ex: count_attributes_in_results(ex, event_type),
+            reverse=True
+        )
+        num_to_select = min(examples_per_event, len(examples_sorted))
+        negative_examples.extend(examples_sorted[:num_to_select])
 
     print("****" * 50)
     return negative_examples
 
+def _display_name(event_type):
+    name = event_type.split("(")[0]
+    parent = event_type[event_type.find("(") + 1:event_type.find(")")] if "(" in event_type else ""
+    spaced = re.sub(r"(\w)([A-Z])", r"\1 \2", name)
+    parent_spaced = re.sub(r"(\w)([A-Z])", r"\1 \2", parent)
+    return f"Event Type: {spaced}\nParent Event Type: {parent_spaced}"
+
+
+def build_from_master(master_file):
+    """Derive (def-like event_type_dict, ontology-like all_guidelines, per-event example_pools)
+    from a single TextEE-style master JSONL, so no separate def_file/ontology/example_dir are needed."""
+    event_type_dict, example_pools, all_guidelines = {}, {}, {}
+    with open(master_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            jsn = json.loads(line)
+            for event_type, payload in jsn.get("event_mentions", {}).items():
+                if event_type == "None":
+                    continue
+                example_pools.setdefault(event_type, []).append(jsn)
+                entry = event_type_dict.setdefault(event_type, {"DisplayName": _display_name(event_type), "Arguments": set()})
+                for result in payload.get("results", []):
+                    for k in result:
+                        if k != "mention":
+                            entry["Arguments"].add(k)
+    for et, entry in event_type_dict.items():
+        entry["Arguments"] = sorted(entry["Arguments"])
+        all_guidelines[et] = {"attributes": {"mention": ""}}
+        for a in entry["Arguments"]:
+            all_guidelines[et]["attributes"][a] = ""
+    return event_type_dict, all_guidelines, example_pools
+
+
 if __name__ == "__main__":
     args = parser.parse_args()
+    random.seed(args.seed)
+    MAX_SAMPLES = args.max_samples  # used by create_examples (module global)
     dataset_name = args.dataset_name
-    #this file has key value pairs of event and attributes
-    all_guidelines = json.load(open(dataset_mapper[dataset_name]["event_arg_ontology"]))
-    with open(dataset_mapper[dataset_name]["def_file"]) as f:
-        event_type_dict = json.load(f)
+
+    example_pools = None
+    example_dir = None
+    if args.master_file:
+        event_type_dict, all_guidelines, example_pools = build_from_master(args.master_file)
+    else:
+        entry = dataset_mapper.get(dataset_name, {})
+        def_file = args.def_file or entry.get("def_file")
+        ontology_path = args.event_arg_ontology or entry.get("event_arg_ontology")
+        example_dir = args.example_dir or entry.get("example_dir")
+        if not def_file or not os.path.exists(def_file):
+            raise SystemExit(f"def_file not found: {def_file}. Pass --master_file (recommended) or --def_file.")
+        with open(def_file) as f:
+            event_type_dict = json.load(f)
+        if ontology_path and os.path.exists(ontology_path):
+            all_guidelines = json.load(open(ontology_path))
+        else:
+            # Ontology only contributes argument names; derive them from def_file when it is absent.
+            all_guidelines = {}
+            for et, e in event_type_dict.items():
+                if et == "None":
+                    continue
+                all_guidelines[et] = {"attributes": {"mention": ""}}
+                for a in e.get("Arguments", []):
+                    if a != "mention":
+                        all_guidelines[et]["attributes"][a] = ""
 
     all_event_types = list(event_type_dict.keys())
+    out_base = os.path.join(args.output_dir, dataset_name)
+    os.makedirs(out_base, exist_ok=True)
 
     for event_type in event_type_dict:
-        print("event_type")
-        print(event_type)
         if event_type == "None":
             continue
         full_argument_list = event_type_dict[event_type]["Arguments"]
-        # print(full_argument_list)
-        # xx
-        examples = create_examples([json.loads(x) for x in open(f"{dataset_mapper[dataset_name]['example_dir']}/{event_type}.json")], event_type, full_argument_list)
-        # negative_examples = create_negative_examples(all_event_types, event_type, dataset_name, 10)  # Example with num_negatives set to 10
-        negative_examples = create_negative_examples(all_event_types,event_type,dataset_name,num_negatives=10,examples_per_event=1)
-        # prompt = create_prompt(event_type, examples, event_type_dict[event_type]["DisplayName"], all_guidelines)
-        prompt = create_prompt(event_type,positive_examples=examples, negative_examples=negative_examples,display_name=event_type_dict[event_type]["DisplayName"], all_guidelines=all_guidelines)
-        os.makedirs(f"prompts/{dataset_name}", exist_ok=True)
-        with open(f"prompts/{dataset_name}/prompt_" + event_type+".txt", "w") as f:
+        if example_pools is not None:
+            positive_pool = example_pools.get(event_type, [])
+        else:
+            positive_pool = _load_event_examples(event_type, example_dir=example_dir)
+        examples = create_examples(positive_pool, event_type, full_argument_list)
+        negative_examples = create_negative_examples(
+            all_event_types, event_type,
+            num_negatives=args.num_negatives, examples_per_event=args.examples_per_event,
+            strategy=args.neg_strategy, example_pools=example_pools, example_dir=example_dir,
+        )
+        prompt = create_prompt(event_type, positive_examples=examples, negative_examples=negative_examples,
+                               display_name=event_type_dict[event_type].get("DisplayName", ""),
+                               all_guidelines=all_guidelines)
+        with open(os.path.join(out_base, "prompt_" + event_type + ".txt"), "w") as f:
             f.write(prompt)
-        # print(f"Covered event type {event_type} with ")
-        # print("-*"*100)
-    # print(event_type_dict)
+        print(f"Wrote prompt for {event_type}")
+    print(f"Done. {sum(1 for et in event_type_dict if et != 'None')} prompts written to {out_base}/")

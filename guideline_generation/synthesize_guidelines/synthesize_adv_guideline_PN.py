@@ -84,16 +84,24 @@ def create_advanced_prompt(event_type, detailed_guidelines):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("-d", "--dataset_name", help="Dataset Name", default="richere-en")
+    parser.add_argument("-d", "--dataset_name", help="Dataset Name (used for mapper fallback)", default="richere-en")
+    parser.add_argument("--input_dir", default=None,
+                        help="Directory of generated P/PN/PS guideline JSONs to consolidate "
+                             "(e.g. ./synthesize_guidelines/synthesized_guidelines/<name>).")
+    parser.add_argument("--output_dir", default=None,
+                        help="Where to write the consolidation prompts adv_<event>.txt "
+                             "(e.g. ./synthesize_guidelines/prompts/<name>_adv_guidelines).")
     args = parser.parse_args()
 
-    # Get dataset-specific directories
+    # Resolve directories: explicit CLI flags take precedence over the (legacy) dataset_mapper.
     dataset_name = args.dataset_name
-    dataset_info = dataset_mapper[dataset_name]
-
-    # Input and output directories
-    input_dir = dataset_info["output_dir"]
-    output_dir = dataset_info["advanced_prompt_dir"]
+    dataset_info = dataset_mapper.get(dataset_name, {})
+    input_dir = args.input_dir or dataset_info.get("output_dir")
+    output_dir = args.output_dir or dataset_info.get("advanced_prompt_dir")
+    if not input_dir or not os.path.isdir(input_dir):
+        raise SystemExit(f"input_dir not found: {input_dir}. Pass --input_dir pointing at the generated P/PN/PS guidelines.")
+    if not output_dir:
+        raise SystemExit("output_dir not set. Pass --output_dir for the consolidation prompts.")
     os.makedirs(output_dir, exist_ok=True)
 
     # Process all JSON files in the input directory
