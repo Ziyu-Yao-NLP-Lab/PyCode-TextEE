@@ -38,10 +38,38 @@ parser.add_argument("-f", "--freq_pen", default = 0.0)
 parser.add_argument("-n", "--pres_pen", default=0.0)
 parser.add_argument("-o", "--out_dir", default="./../synthesize_guidelines/synthesized_guidelines/")
 parser.add_argument("-d", "--dataset_name", default="richere-en")
+# Backend / credentials (kept backward compatible: Azure remains the default).
+parser.add_argument("--api_type", choices=["azure", "openai"], default="azure",
+                    help="LLM backend: Azure OpenAI (default) or standard OpenAI.")
+parser.add_argument("--azure_endpoint", default=os.environ.get("AZURE_OPENAI_ENDPOINT"),
+                    help="Azure endpoint URL (or set AZURE_OPENAI_ENDPOINT). Overrides the built-in default.")
+parser.add_argument("--azure_deployment", default=os.environ.get("AZURE_OPENAI_DEPLOYMENT"),
+                    help="Azure deployment name (defaults to the model name in MODEL_MAP).")
+parser.add_argument("--api_version", default=os.environ.get("AZURE_OPENAI_API_VERSION"),
+                    help="Azure API version (defaults to the value in MODEL_MAP).")
+# Optional: only used to source the 'mention' description; a default is used if omitted.
+parser.add_argument("--event_arg_ontology", default=None,
+                    help="Optional path to Master_event_dataclasses_<dataset>.json. If omitted, "
+                         "a default 'mention' description is used and no scratch path is needed.")
+parser.add_argument("--dry_run", action="store_true",
+                    help="Validate the pipeline (prompt loading, parsing, file writing) without calling the API.")
 
 MODEL_MAP = {
     "gpt-4o": {"name": "gpt-4o-2024-05-13", "endpoint": "https://azure-openai-api-eastus2.openai.azure.com/", "api_version": "2024-04-01-preview"}
 }
+
+# Canonical mention description used across all released guidelines; fallback when no ontology is provided.
+DEFAULT_MENTION = "The text span that triggers the event."
+
+# Well-formed sample response used by --dry_run so the full parse/write path can be exercised offline.
+DRY_RUN_RESPONSE = """Here are the guidelines:
+```json
+{
+  "Event Definition": ["Definition 1", "Definition 2", "Definition 3", "Definition 4", "Definition 5"],
+  "Arguments Definitions": {"entity": ["e1", "e2", "e3", "e4", "e5"], "place": ["p1", "p2", "p3", "p4", "p5"]}
+}
+```
+"""
 
 
 # guidelines = json.load(open("./../synthesize_guidelines/fewevent_event_dataclasses.json"))
@@ -54,7 +82,11 @@ def parse_response(response, event_name, guidelines):
     response = response if(type(response) == type({})) else ast.literal_eval(response)
     # print(response)
     event_name = event_name.replace("prompt_", "").strip()
-    return_dict = {event_name:{"description":None}, "attributes":{"mention": guidelines[event_name]["attributes"]["mention"]}}
+    try:
+        mention = guidelines[event_name]["attributes"]["mention"]
+    except (KeyError, TypeError):
+        mention = DEFAULT_MENTION
+    return_dict = {event_name:{"description":None}, "attributes":{"mention": mention}}
     # print("<<<", return_dict)
     # print(">>>", type(response))
     return_dict[event_name]["description"] = response["Event Definition"]
@@ -88,17 +120,20 @@ def get_response(model, prompt, args, client, event_name, guidelines, dataset_na
                 time.sleep(cooldown_period)
                 total_tokens_used = 0  # Reset after cooldown
 
-            # Send the request to the OpenAI API
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=args.temperature,
-                max_tokens=args.max_tokens,
-                top_p=args.top_p,
-                frequency_penalty=args.freq_pen,
-                presence_penalty=args.pres_pen
-            )
-            response = response.choices[0].message.content
+            # Send the request to the OpenAI API (or use a canned response in dry-run mode)
+            if getattr(args, "dry_run", False):
+                response = DRY_RUN_RESPONSE
+            else:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=args.temperature,
+                    max_tokens=args.max_tokens,
+                    top_p=args.top_p,
+                    frequency_penalty=args.freq_pen,
+                    presence_penalty=args.pres_pen
+                )
+                response = response.choices[0].message.content
             
             # Save logs
             os.makedirs(f"./logs/{dataset_name}", exist_ok=True)
@@ -129,7 +164,8 @@ def get_response(model, prompt, args, client, event_name, guidelines, dataset_na
                 time.sleep(cooldown_period)
 
             # Add a delay between successful requests
-            time.sleep(delay)
+            if not getattr(args, "dry_run", False):
+                time.sleep(delay)
             return largest_json
 
         except OpenAIError as e:
@@ -146,18 +182,45 @@ if __name__ == "__main__":
     args = parser.parse_args()
     dataset_name = args.dataset_name
     args.out_dir = os.path.join(args.out_dir, dataset_name)
-    guidelines = json.load(open(dataset_mapper[dataset_name]["event_arg_ontology"]))
-    openai_key = os.environ.get("OPENAI_API_KEY")
-    if(openai_key is None):
-        os.environ["OPENAI_API_KEY"] = openai_key = getpass.getpass(prompt='Enter your OPENAI_API_KEY: ')
-    client = AzureOpenAI(
-    api_key=openai_key,
-    api_version=MODEL_MAP[args.llm]["api_version"],
-    azure_endpoint=MODEL_MAP[args.llm]["endpoint"],
-    azure_deployment=MODEL_MAP[args.llm]["name"]
-    )
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    # Optional ontology: used only to source the per-event 'mention' description.
+    # Resolve from --event_arg_ontology, else the mapper (if present), else skip (a default is used).
+    ontology_path = args.event_arg_ontology
+    if ontology_path is None and dataset_name in dataset_mapper:
+        ontology_path = dataset_mapper[dataset_name].get("event_arg_ontology")
+    if ontology_path and os.path.exists(ontology_path):
+        guidelines = json.load(open(ontology_path))
+    else:
+        if ontology_path:
+            print(f"[warn] event_arg_ontology not found at '{ontology_path}'; using default 'mention' description.")
+        guidelines = {}
+
+    model_name = MODEL_MAP[args.llm]["name"]
+    client = None
+    if not args.dry_run:
+        openai_key = os.environ.get("OPENAI_API_KEY")
+        if(openai_key is None):
+            os.environ["OPENAI_API_KEY"] = openai_key = getpass.getpass(prompt='Enter your OPENAI_API_KEY: ')
+        if args.api_type == "azure":
+            client = AzureOpenAI(
+                api_key=openai_key,
+                api_version=args.api_version or MODEL_MAP[args.llm]["api_version"],
+                azure_endpoint=args.azure_endpoint or MODEL_MAP[args.llm]["endpoint"],
+                azure_deployment=args.azure_deployment or model_name,
+            )
+        else:
+            from openai import OpenAI
+            client = OpenAI(api_key=openai_key)
+    else:
+        print("[dry_run] Skipping API client creation; using canned responses.")
+
     prompt_files = glob(os.path.join(os.path.join(args.prompt_dir, dataset_name), "*.txt"))
-    existing_files = [os.path.split(ff)[-1].replace("prompt_", "").replace(".json", "") for ff in glob(f"/scratch/spati/tmp/LLaMA-Events_w_neg_samples/synthesize_guidelines/synthesized_guidelines/{dataset_name}/*.json")]
+    if not prompt_files:
+        print(f"[warn] No prompt .txt files found under {os.path.join(args.prompt_dir, dataset_name)}. "
+              f"Check --prompt_dir and --dataset_name (e.g. ACE_15random_examples).")
+    # Skip events already generated in the output directory (resumable).
+    existing_files = [os.path.split(ff)[-1].replace("prompt_", "").replace(".json", "") for ff in glob(os.path.join(args.out_dir, "*.json"))]
     # print(existing_files)
     for prompt_file in tqdm(prompt_files, total = len(prompt_files), desc = "Prompting ..."):
         event_name = os.path.split(prompt_file)[-1].replace("prompt_", "").replace(".txt", "")
@@ -173,11 +236,12 @@ if __name__ == "__main__":
         # xx
         prompt = "".join([lines for lines in open(prompt_file)])
         #model, prompt, args, client, event_name, guidelines, dataset_name):
-        get_response(args.llm, prompt, args, client, prompt_file, guidelines, dataset_name)
+        get_response(model_name, prompt, args, client, prompt_file, guidelines, dataset_name)
         # break
 
         # Add a delay to avoid hitting the rate limit
-        time.sleep(2)
+        if not args.dry_run:
+            time.sleep(2)
 
 
 

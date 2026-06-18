@@ -346,15 +346,46 @@ respectively.
 
 **Note**: We’ve already the synethesized guidelines and available human guidelines in directory `guideline_generation/synthesize_guidelines/synthesized_guidelines`
 
-To generate the guidelines, please run the following command:
+To (re)generate the guidelines, or to generate them for a new dataset, run the pipeline below from
+the `guideline_generation` directory:
 ```bash
 cd guideline_generation
-python synthesize_guidelines/create_dictionaries.py --dataset_name <dataset_name>
-python prompting/prompt_llms.py #generates guidelines P, PN, PS
-python prompting/prompt_llm_adv_guidelines.py #generates Int- guidelines
-cd .. # to navigate to home directory
+
+# (0) Credentials. Azure OpenAI is the default; pass --api_type openai for standard OpenAI.
+export OPENAI_API_KEY="<your key>"
+export AZURE_OPENAI_ENDPOINT="https://<your-resource>.openai.azure.com/"   # Azure only
+
+# (1) Convert TextEE processed data into the guideline "master" JSONL (the first hop).
+python utils/textee_to_master.py -d <dataset_name> -i <TextEE/processed_data> \
+    --split split1 --files train.json -o ./synthesize_guidelines/master_<dataset_name>.jsonl
+
+# (2) Build the per-event prompts from the master file.
+#     --neg_strategy sibling -> Guideline-PS, random -> Guideline-PN; add --examples_per_event 0 for
+#     positive-only Guideline-P. Negative sampling is seeded (--seed) for reproducibility.
+python synthesize_guidelines/synthesize_guidelines_w_neg_samples.py \
+    --master_file ./synthesize_guidelines/master_<dataset_name>.jsonl \
+    --dataset_name <prompt_set> --neg_strategy sibling --seed 1337 \
+    --output_dir ./synthesize_guidelines/prompts
+
+# (3) Generate the P / PN / PS guidelines from those prompts (add --dry_run to test without the API).
+python prompting/prompt_llms.py --dataset_name <prompt_set> \
+    --prompt_dir ./synthesize_guidelines/prompts \
+    --out_dir ./synthesize_guidelines/synthesized_guidelines/
+
+# (4) [Optional] Integrated variants (Guideline-PN-Int / PS-Int): build the consolidation prompts
+#     from the generated guidelines, then prompt the LLM with them.
+python synthesize_guidelines/synthesize_adv_guideline_PN.py \
+    --input_dir ./synthesize_guidelines/synthesized_guidelines/<prompt_set> \
+    --output_dir ./synthesize_guidelines/prompts/<prompt_set>_INT
+python prompting/prompt_llm_adv_guidelines.py --dataset_name <prompt_set>_INT \
+    --prompt_dir ./synthesize_guidelines/prompts \
+    --out_dir ./synthesize_guidelines/synthesized_guidelines/
+
+cd ..  # back to the repo root
 ```
-where, `<dataset_name>` refers to the dataset for which the guidelines need to be genrated (e.g., ace05-en), `<guideline_type>` refers to one of the 5 variants discussed above, i.e., one from Guideline-P (P), Guideline-PN (PN), Guideline-PS (PS), Guideline-PN-Int (PNI) or Guideline-PS-Int (PSI).
+where `<dataset_name>` is a TextEE dataset (e.g. `ace05-en`) and `<prompt_set>` is any name you pick
+for the generated prompt/guideline subdir (e.g. `ace05_PS`). Pass `--dry_run` to the two `prompt_*`
+scripts to validate the full pipeline offline (no API key or spend).
 ### 📘 Guideline File Format
 After above code execution, the guidelines will be stored in the file `<output_file>`. Please make sure that your guideline file looks like:
 
